@@ -3,15 +3,15 @@ import matlab_style_functions as msf
 import numpy as np
 from scipy import signal
 from tqdm import tqdm
+import utils
 
-def naming_convention(i):
-    # zfill pads string with zeros from leading edge until len(string) = 6
-    return 'IMG' + str(i).zfill(6)
+image_array = []
+desired_resolution = image_array[0].shape * 0.5
 
 """Time constants and kernels"""
 
 photo_z = {"b" : np.array([0, 0.0001, -0.0011, 0.0052, -0.0170, 0.0439, -0.0574, 0.1789, -0.1524]), 
-            "a" : np.array([1, -4.3331, 8.6847, -10.7116, 9.0004, -5.3058, 2.1448, -0.5418, 0.0651])}
+           "a" : np.array([1, -4.3331, 8.6847, -10.7116, 9.0004, -5.3058, 2.1448, -0.5418, 0.0651])}
 
 Ts = 0.001 # 1 ms timestep
 LPF5_TAU = 25 * Ts
@@ -145,7 +145,6 @@ with tqdm(total=len(image_array)) as pbar:
             a_off = (off_f[t,:,:] - fdsr_off[t,:,:]).clip(min=0)
             
             # Inhibition is implemented as spatial filter
-            # Not true if this is a chemical synapse as this would require delays
             # Half-wave rectification added
             on_filtered = msf.matlab_style_conv2(a_on, INHIB_KERNEL, mode='same', pad_width=pad_width).clip(min=0)
             off_filtered = msf.matlab_style_conv2(a_off, INHIB_KERNEL, mode='same', pad_width=pad_width).clip(min=0)
