@@ -1,12 +1,11 @@
 import cv2
 from glob import glob
-import matplotlib.pyplot as plt
 import numpy as np
 import os
 from tqdm import tqdm
 
 import matlab_style_functions as msf
-from utils import initialisations, IIR_Filter, naming_convention
+from utils import *
 
 """Time constants and kernels"""
 class params():
@@ -14,14 +13,17 @@ class params():
     def __init__(self):
         self.photo_z = {"b" : np.array([0, 0.0001, -0.0011, 0.0052, -0.0170, 0.0439, -0.0574, 0.1789, -0.1524]), 
                         "a" : np.array([1, -4.3331, 8.6847, -10.7116, 9.0004, -5.3058, 2.1448, -0.5418, 0.0651])}
+        
+        # Latency incurred by temporal band-pass filter
+        self.delay = len(self.photo_z["b"]) + 1
 
-        self.Ts = 0.001 # 1 ms timestep
+        self.Ts = 0.05 # 1 ms timestep
         self.LPF5_TAU = 25 * self.Ts
 
         self.LPF_5 = {"b" : np.array([1 / (1 + 2*self.LPF5_TAU/self.Ts), 1 / (1 + 2*self.LPF5_TAU/self.Ts)]), 
                       "a" : np.array([1, (1 - 2*self.LPF5_TAU/self.Ts) / (1 + 2*self.LPF5_TAU/self.Ts)])}
 
-        self.LPF5_K = np.exp(-1*0.05 / self.LPF5_TAU)
+        self.LPF5_K = np.exp(-1*self.Ts / self.LPF5_TAU)
 
         self.LPFHR_TAU = 40 * self.Ts
 
@@ -33,10 +35,10 @@ class params():
                                       [-1, 8, -1], 
                                       [-1, -1, -1]]) * 1/9
         
-        self.FDSR_TAU_FAST_ON = 0.5/50
-        self.FDSR_TAU_FAST_OFF = 0.5/50
+        self.FDSR_TAU_FAST_ON = 0.5/50 * self.Ts * 1000
+        self.FDSR_TAU_FAST_OFF = 0.5/50 * self.Ts * 1000
         
-        self.FDSR_TAU_SLOW = 5.0/50
+        self.FDSR_TAU_SLOW = 5.0/50 * self.Ts * 1000
         
         self.FDSR_K_FAST_ON = np.exp(-1*self.Ts / self.FDSR_TAU_FAST_ON)
         self.FDSR_K_FAST_OFF = np.exp(-1*self.Ts / self.FDSR_TAU_FAST_OFF)
@@ -49,6 +51,10 @@ class params():
                                             [-1, 0, 2, 0, -1],
                                             [-1, 0, 0, 0, -1],
                                             [-1, -1, -1, -1, -1]])
+        
+        self.spontaneous_rate = 20
+        self.inh_exc_ratio = 0.3
+        self.LPTC_factor = 100.4307 # Scaling coefficient to give biophysical meaning to LPTC model activation
 
 class model_initialisation(params):
     def __init__(self, image_array_files, desired_resolution):
@@ -66,7 +72,10 @@ class model_initialisation(params):
         self.height, self.width = cv2.imread(self.image_array_files[0]).shape[:-1]
             
         self.degrees_in_image = self.desired_resolution[1]
-        self.image_size, self.ds_size, self.H, self.pad_width = initialisations(self.degrees_in_image, (self.height, self.width))
+        self.image_size, self.ds_size, self.H, self.pad_width, self.pixel2PR = initialisations(self.degrees_in_image, (self.height, self.width))
+        
+        # Image buffer
+        self.image_buffer = np.zeros((*self.image_size, 3, self.delay))
         
         # Two channels to act as buffer i.e. -1 indexed channel is previous timestep's output
         self.on_f = np.zeros((2, *self.ds_size), dtype=np.float16)
@@ -79,6 +88,10 @@ class model_initialisation(params):
         self.OFFbuffer = np.zeros_like(self.dbuffer1)
         
         self.EHR_buffer_right = np.zeros_like(self.dbuffer1)
+        self.ON_HR_buffer_right = np.zeros_like(self.dbuffer1)
+        self.OFF_HR_buffer_right = np.zeros_like(self.dbuffer1)
+        
+        return self.pixel2PR, self.ds_size, self.delay
         
         # vf = rf(pixels_to_keep, args.background, args.experiment_number, bg_contrast).run()
 
@@ -89,11 +102,14 @@ class early_visual_processing(model_initialisation):
 
     def model(self):
         
+        self.image_buffer[...,-1] = image
+        # image[...,[2,1,0]]
+        
         # Extract green channel from BGR
         green = image[...,1]
         
-        pixels_per_degree = self.image_size[1] / self.degrees_in_image # horizontal pixels in output / horizontal degrees (97.84)
-        pixel2PR = int(pixels_per_degree) # ratio of pixels to photoreceptors in the bio-mimetic model (1 deg spatial sampling... )
+        # pixels_per_degree = self.image_size[1] / self.degrees_in_image # horizontal pixels in output / horizontal degrees (97.84)
+        # pixel2PR = int(pixels_per_degree) # ratio of pixels to photoreceptors in the bio-mimetic model (1 deg spatial sampling... )
         
         #     # Downsampled receptive fields
         #     Downsampledvf = cv2.resize(vf, np.flip(ds_size), interpolation=cv2.INTER_NEAREST)
@@ -102,7 +118,7 @@ class early_visual_processing(model_initialisation):
         sf = cv2.filter2D(green, -1, self.H)
         
         # Downsampled green channel
-        DownsampledGreen = sf[::pixel2PR, ::pixel2PR]
+        DownsampledGreen = cv2.resize(sf, np.flip(ds_size), interpolation=cv2.INTER_AREA)
         
         # Photoreceptor output after temporal band-pass filtering
         PhotoreceptorOut, self.dbuffer1 = IIR_Filter(self.photo_z["b"], self.photo_z["a"], DownsampledGreen/255, self.dbuffer1)
@@ -115,9 +131,9 @@ class early_visual_processing(model_initialisation):
         self.on_f[1,...] = np.maximum(LMC_Out, 0.0)
         self.off_f[1,...] = -np.minimum(LMC_Out, 0.0)
         
-        return self.on_f, self.off_f
+        return self.image_buffer, self.on_f, self.off_f
 
-"""Target-matched filtering"""    
+"""Target-matched filtering"""
 class target_matched_filtering(model_initialisation):
     def __init__(self):
         super(target_matched_filtering, self).__init__()
@@ -184,13 +200,56 @@ class directional_selectivity(model_initialisation):
             
             return EHR_left
         
-image_array_files = glob('../../STMD/4496768/STNS3/28/*.jpg')   
-direction = 'left'     
-model_inits = model_initialisation(image_array_files, desired_resolution=(72, 72))
-model_inits.initialisations()
+class LPTC(model_initialisation):
+    def __init__(self):
+        super(LPTC, self).__init__()
+        
+    def model(self):
+        
+        # Delayed channels using z-transform for HR
+        On_HR_Delayed_Output_right, self.ON_HR_buffer_right = IIR_Filter(self.LPF_HR["b"], self.LPF_HR["a"], on_f[1,...].copy(), self.ON_HR_buffer_right)
+        Off_HR_Delayed_Output_right, self.OFF_HR_buffer_right = IIR_Filter(self.LPF_HR["b"], self.LPF_HR["a"], off_f[1,...].copy(), self.OFF_HR_buffer_right)
+        
+        # Correlate delayed channels
+        on_HR_right = (On_HR_Delayed_Output_right[:,:-1] * on_f[1,:,1:]) - ((on_f[1,:,:-1] * On_HR_Delayed_Output_right[:,1:]))
+        off_HR_right = (Off_HR_Delayed_Output_right[:,:-1] * off_f[1,:,1:]) - ((off_f[1,:,:-1] * Off_HR_Delayed_Output_right[:,1:]))
+    
+        # Correlate delayed channels
+        on_HR_left = -(On_HR_Delayed_Output_right[:,:-1] * on_f[1,:,1:]) + (1*(on_f[1,:,:-1] * On_HR_Delayed_Output_right[:,1:]))
+        off_HR_left = -(Off_HR_Delayed_Output_right[:,:-1] * off_f[1,:,1:]) + (1*(off_f[1,:,:-1] * Off_HR_Delayed_Output_right[:,1:]))
+        
+        # Clamping
+        EMD_Output_right = on_HR_right + off_HR_right
+        EMD_Output_left = on_HR_left + off_HR_left
+        
+        LPTC_right = np.sum(EMD_Output_right).clip(min=0) - self.inh_exc_ratio * np.sum(EMD_Output_left).clip(min=0)
+        LPTC_left = np.sum(EMD_Output_left).clip(min=0) - self.inh_exc_ratio * np.sum(EMD_Output_right).clip(min=0)
+        
+        # Biophysical asymmetric LPTC outputs
+        EMD_sp_right = self.LPTC_factor * LPTC_right + self.spontaneous_rate
+        EMD_sp_left = self.LPTC_factor * LPTC_left + self.spontaneous_rate
+        
+        return EMD_sp_left, EMD_sp_right
+        
+input_image_folder = 'STNS22_47'
+folder_bits = input_image_folder.split('_')
 
-os.makedirs('STNS3_28/images', exist_ok=True)
-os.makedirs('STNS3_28/ESTMD_Output', exist_ok=True)
+ground_truths = []
+with open(f'../../STMD/4496768/{folder_bits[0]}/{folder_bits[1]}/GroundTruth.txt', 'r') as ground_truth_file:
+    for line in ground_truth_file:
+        # Save all ground truths as tuples
+        ground_truths.append(eval(line.rstrip()))
+
+image_array_files = glob(f'../../STMD/4496768/{folder_bits[0]}/{folder_bits[1]}/*.jpg')
+direction = 'right'     
+model_inits = model_initialisation(image_array_files, desired_resolution=(None, 50))
+pixel2PR, ds_size, delay = model_inits.initialisations()
+
+os.makedirs(f'{input_image_folder}/dESTMD_Output', exist_ok=True)
+
+frames = []
+LPTC_left_array = []
+LPTC_right_array = []
 
 with tqdm(total=len(image_array_files)) as pbar:
     for t, file in enumerate(image_array_files):
@@ -198,9 +257,13 @@ with tqdm(total=len(image_array_files)) as pbar:
         pbar.update(1)
         
         image = cv2.imread(file)
+        # image = np.ones(image.shape) * 255
+        
+        # image[8:36, t:t+28, :] = 0
+        # image[50:78, image.shape[2]-t-28:image.shape[2]-t, :] = 0
         
         """ESTMD model early visual processing -- Wiederman et al. (2008)"""
-        on_f, off_f = early_visual_processing.model(model_inits)
+        image_buffer, on_f, off_f = early_visual_processing.model(model_inits)
         
         if t > 0:
             
@@ -217,12 +280,41 @@ with tqdm(total=len(image_array_files)) as pbar:
         
             """LPTC model"""
             
-            cv2.imwrite(f'STNS3_28/images/{naming_convention(t+1)}.png', image)
-            plt.imsave(f'STNS3_28/ESTMD_Output/{naming_convention(t+1)}.png', ESTMD_Output, dpi=500)
+            LPTC_left, LPTC_right = LPTC.model(model_inits)
+            
+            LPTC_left_array.append(LPTC_left)
+            LPTC_right_array.append(LPTC_right)
+            
+            """"Plotting"""
+            if t >= delay:
+                bbox = ground_truths[t-delay]
+                bbox = None
+                
+                patches = output_images(dESTMD_Output, image_buffer, t, delay, pixel2PR, bbox, f'{input_image_folder}/dESTMD_Output')
+                frames.append(patches)
             
             # Buffer updates
+            image_buffer[...,:-1] = image_buffer[...,1:]
+            
             on_f[0,...] = on_f[1,...]
             off_f[0,...] = off_f[1,...]
             
             fdsr_on[0,...] = fdsr_on[1,...]
             fdsr_off[0,...] = fdsr_off[1,...]
+    
+    """Saving video"""
+    print('saving video...')
+    image_folder = f'{input_image_folder}/dESTMD_Output/*.png'
+    images = glob(image_folder)
+    img_array = []
+    for filename in images:
+        img = cv2.imread(filename)
+        height, width, layers = img.shape
+        size = (width, height)
+        img_array.append(img)
+        
+    out = cv2.VideoWriter(f'{input_image_folder}/dESTMD_Output/images.mp4', cv2.VideoWriter_fourcc(*'mp4v'), 20, size)
+     
+    for i in range(len(img_array)):
+        out.write(img_array[i])
+    out.release()
